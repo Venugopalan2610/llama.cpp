@@ -931,6 +931,20 @@ struct ggml_cuda_type_traits<GGML_TYPE_MXFP4> {
     static constexpr int qi = QI_MXFP4;
 };
 
+// QTIP 2-bit trellis: 256 elements per block, 1 float per quantized element (no sub-element quantization)
+// qr=1 means each quant index maps to 1 output element (though QTIP actually uses V=2, the block is self-contained)
+// qi=1 because QTIP blocks aren't compatible with the standard vec_dot_q8 pattern
+#define QK_QTIP_2B QTIP_BLOCK_SIZE
+#define QR_QTIP_2B 1
+#define QI_QTIP_2B 1
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_QTIP_2B> {
+    static constexpr int qk = QK_QTIP_2B;
+    static constexpr int qr = QR_QTIP_2B;
+    static constexpr int qi = QI_QTIP_2B;
+};
+
 template<>
 struct ggml_cuda_type_traits<GGML_TYPE_Q2_K> {
     static constexpr int qk = QK_K;

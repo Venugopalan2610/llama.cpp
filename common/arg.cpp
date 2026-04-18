@@ -2365,6 +2365,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SPLIT_MODE"));
     add_opt(common_arg(
+        {"--qtip-expert-offload"},
+        "keep MoE expert weights in CPU pinned memory and use GPU dequant cache\n"
+        "(reduces VRAM usage for QTIP quantized MoE models)",
+        [](common_params & params) {
+            params.qtip_expert_offload = true;
+        }
+    ).set_env("LLAMA_ARG_QTIP_EXPERT_OFFLOAD"));
+    add_opt(common_arg(
         {"-ts", "--tensor-split"}, "N0,N1,N2,...",
         "fraction of the model to offload to each GPU, comma-separated list of proportions, e.g. 3,1",
         [](common_params & params, const std::string & value) {

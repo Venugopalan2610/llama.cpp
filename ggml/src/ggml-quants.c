@@ -2668,6 +2668,122 @@ void dequantize_row_q8_K(const block_q8_K * GGML_RESTRICT x, float * GGML_RESTRI
     }
 }
 
+// ================================ QTIP dequantization =============================================
+
+#include "qtip_tlut.h"
+
+void dequantize_block_qtip_2b(const block_qtip_2b * GGML_RESTRICT block, float * GGML_RESTRICT y) {
+    float scale = GGML_FP16_TO_FP32(block->d);
+
+    // Step 0: read initial state (bits 0-15)
+    uint16_t state = block->trellis_data[0] | (block->trellis_data[1] << 8);
+
+    // Decode first 2 values from initial state
+    // HYB decode: scramble = state*(state+1), index from bits [6..14], sign flip component 1 if bit 15 set
+    uint32_t scramble = (uint32_t)(state + 1) * state;
+    int sflp = 1 - ((scramble >> 15) & 1) * 2;
+    int index = (scramble >> 6) & 511;
+    y[0] = qtip_tlut[index][0] * scale;
+    y[1] = qtip_tlut[index][1] * sflp * scale;
+
+    // Decode remaining 127 steps
+    for (int j = 1; j < 128; j++) {
+        int bit_pos = 16 + (j - 1) * 4;
+        int byte_idx = bit_pos / 8;
+        uint16_t two_bytes;
+        if (byte_idx + 1 < 66) {
+            two_bytes = block->trellis_data[byte_idx]
+                      | (block->trellis_data[byte_idx + 1] << 8);
+        } else {
+            two_bytes = block->trellis_data[byte_idx];
+        }
+        uint8_t new_bits = (two_bytes >> (bit_pos % 8)) & 0xF;
+        state = ((state << 4) & 0xFFFF) | new_bits;
+
+        scramble = (uint32_t)(state + 1) * state;
+        sflp = 1 - ((scramble >> 15) & 1) * 2;
+        index = (scramble >> 6) & 511;
+        y[j*2]     = qtip_tlut[index][0] * scale;
+        y[j*2 + 1] = qtip_tlut[index][1] * sflp * scale;
+    }
+}
+
+// Fast Hadamard Transform (in-place)
+// n must be a power of 2
+void ggml_fht_f32(float * x, int n) {
+    if (n <= 1) return;
+    for (int h = 1; h < n; h <<= 1) {
+        for (int i = 0; i < n; i += (h << 1)) {
+            for (int j = i; j < i + h; j++) {
+                float x0 = x[j];
+                float x1 = x[j + h];
+                x[j]     = x0 + x1;
+                x[j + h] = x0 - x1;
+            }
+        }
+    }
+    float scale = 1.0f / sqrtf((float)n);
+    for (int i = 0; i < n; i++) {
+        x[i] *= scale;
+    }
+}
+
+void dequantize_row_qtip_2b(const block_qtip_2b * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QTIP_BLOCK_SIZE == 0);
+    const int64_t nb = k / QTIP_BLOCK_SIZE;
+
+    for (int i = 0; i < nb; i++) {
+        dequantize_block_qtip_2b(&x[i], &y[i * QTIP_BLOCK_SIZE]);
+    }
+
+    // Note: Hadamard + sign transforms are applied at the graph level
+    // (ggml_hadamard + ggml_mul in the model builder), not here.
+    // This function outputs raw trellis-decoded values (W̃).
+}
+
+void ggml_vec_dot_qtip_2b_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * vy, size_t by, int nrc) {
+    assert(n % QTIP_BLOCK_SIZE == 0);
+
+    // Note: Hadamard + sign transforms are applied at the graph level.
+    // This function computes a simple dot product of raw trellis-decoded
+    // weights with the (already pre-transformed) input activations.
+
+    if (by == 0) {
+        // Shared activations for all rows (GEMV case)
+        const float * y = (const float *) vy;
+
+        for (int k = 0; k < nrc; k++) {
+            const block_qtip_2b * x = (const block_qtip_2b *) ((const char *) vx + k * bx);
+            float sumf = 0.0f;
+            float tmp[QTIP_BLOCK_SIZE];
+            const int nb = n / QTIP_BLOCK_SIZE;
+            for (int i = 0; i < nb; i++) {
+                dequantize_block_qtip_2b(&x[i], tmp);
+                for (int j = 0; j < QTIP_BLOCK_SIZE; j++) {
+                    sumf += tmp[j] * y[i * QTIP_BLOCK_SIZE + j];
+                }
+            }
+            s[k * bs / sizeof(float)] = sumf;
+        }
+    } else {
+        // Unique activations for each row (Multi-vector case)
+        for (int k = 0; k < nrc; k++) {
+            const block_qtip_2b * x = (const block_qtip_2b *) ((const char *) vx + k * bx);
+            const float * y = (const float *) ((const char *) vy + k * by);
+
+            float sumf = 0.0f;
+            float tmp[QTIP_BLOCK_SIZE];
+            const int nb = n / QTIP_BLOCK_SIZE;
+            for (int i = 0; i < nb; i++) {
+                dequantize_block_qtip_2b(&x[i], tmp);
+                for (int j = 0; j < QTIP_BLOCK_SIZE; j++) {
+                    sumf += tmp[j] * y[i * QTIP_BLOCK_SIZE + j];
+                }
+            }
+            s[k * bs / sizeof(float)] = sumf;
+        }
+    }
+}
 // ================================ IQ2 quantization =============================================
 
 typedef struct {

@@ -9805,6 +9805,64 @@ static void ggml_compute_forward_get_rel_pos_f16(
     }
 }
 
+// ggml_compute_forward_hadamard
+// Walsh-Hadamard transform on the last dimension, scaled by 1/sqrt(n).
+// Parallelized across rows (ne[1] * ne[2] * ne[3]).
+
+void ggml_compute_forward_hadamard(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(src0));
+
+    const int64_t ne0 = src0->ne[0]; // transform dimension (must be power of 2)
+    const int64_t n_rows = ggml_nrows(src0);
+
+    GGML_ASSERT(ne0 > 0 && (ne0 & (ne0 - 1)) == 0);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const float * src_data = (const float *) src0->data;
+    float * dst_data = (float *) dst->data;
+
+    // Distribute rows across threads
+    const int64_t rows_per_thread = (n_rows + nth - 1) / nth;
+    const int64_t row_start = ith * rows_per_thread;
+    const int64_t row_end = std::min(row_start + rows_per_thread, n_rows);
+
+    for (int64_t row = row_start; row < row_end; row++) {
+        const float * src_row = src_data + row * ne0;
+        float * dst_row = dst_data + row * ne0;
+
+        // Copy src to dst if not in-place
+        if (src_row != dst_row) {
+            memcpy(dst_row, src_row, ne0 * sizeof(float));
+        }
+
+        // In-place Fast Walsh-Hadamard Transform (butterfly algorithm)
+        for (int64_t h = 1; h < ne0; h <<= 1) {
+            for (int64_t i = 0; i < ne0; i += (h << 1)) {
+                for (int64_t j = i; j < i + h; j++) {
+                    float a = dst_row[j];
+                    float b = dst_row[j + h];
+                    dst_row[j]     = a + b;
+                    dst_row[j + h] = a - b;
+                }
+            }
+        }
+
+        // Scale by 1/sqrt(n)
+        const float scale = 1.0f / sqrtf((float)ne0);
+        for (int64_t i = 0; i < ne0; i++) {
+            dst_row[i] *= scale;
+        }
+    }
+}
+
 void ggml_compute_forward_get_rel_pos(
         const ggml_compute_params * params,
         ggml_tensor * dst) {

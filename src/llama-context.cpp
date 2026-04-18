@@ -2063,7 +2063,9 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     if (model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_KIMI_LINEAR || model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE) {
         return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
     }
-    uint32_t res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
+    // QTIP-quantized OLMoE creates many extra intermediate tensors
+    // (Hadamard, scale, sign ops for each matmul in MoE + attention)
+    uint32_t res = std::max<uint32_t>(1024u, (model.arch == LLM_ARCH_OLMOE ? 16u : 8u)*model.n_tensors());
     for (const auto & lora : model.loras) {
         res += lora->get_n_nodes();
     }
@@ -2152,6 +2154,7 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
+        /*.qtip_signs  =*/ &model.qtip_sign_map,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),

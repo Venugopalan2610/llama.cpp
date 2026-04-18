@@ -24,6 +24,8 @@
 #include "ggml-cuda/diag.cuh"
 #include "ggml-cuda/fattn.cuh"
 #include "ggml-cuda/getrows.cuh"
+#include "ggml-cuda/hadamard.cuh"
+#include "ggml-cuda/qtip-dequant.cuh"
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
@@ -1330,7 +1332,14 @@ static void ggml_cuda_op_mul_mat_cublas(
     } else if (fast_fp16_hardware_available(cc) && use_fp16) {
         // convert src0 and src1 to fp16, multiply as fp16, convert dst to fp32
         ggml_cuda_pool_alloc<half> src0_as_f16(ctx.pool(id));
-        if (src0->type != GGML_TYPE_F16) {
+        if (src0->type == GGML_TYPE_QTIP_2B) {
+            // QTIP tiles are stored in row_tile-major order (16×16 tiles, not row blocks).
+            // Use matrix-aware dequant that writes to correct (row, col) positions.
+            size_t ne = row_diff*ne00;
+            src0_as_f16.alloc(ne);
+            dequantize_matrix_qtip_2b_cuda<half>(src0_dd_i, src0_as_f16.get(),
+                                                  row_diff, ne00, stream);
+        } else if (src0->type != GGML_TYPE_F16) {
             const to_fp16_cuda_t to_fp16_cuda = ggml_get_to_fp16_cuda(src0->type);
             GGML_ASSERT(to_fp16_cuda != nullptr);
             size_t ne = row_diff*ne00;
@@ -1390,7 +1399,11 @@ static void ggml_cuda_op_mul_mat_cublas(
         ggml_cuda_pool_alloc<float> src0_ddq_as_f32(ctx.pool(id));
         ggml_cuda_pool_alloc<float> src1_ddq_as_f32(ctx.pool(id));
 
-        if (src0->type != GGML_TYPE_F32) {
+        if (src0->type == GGML_TYPE_QTIP_2B) {
+            src0_ddq_as_f32.alloc(row_diff*ne00);
+            dequantize_matrix_qtip_2b_cuda<float>(src0_dd_i, src0_ddq_as_f32.get(),
+                                                   row_diff, ne00, stream);
+        } else if (src0->type != GGML_TYPE_F32) {
             const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(src0->type);
             GGML_ASSERT(to_fp32_cuda != nullptr);
             src0_ddq_as_f32.alloc(row_diff*ne00);
@@ -2206,7 +2219,9 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
                                    src0->view_src;
 
-    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
+    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear &&
+                             src0->type != GGML_TYPE_QTIP_2B &&
+                             src1->type == GGML_TYPE_F32 &&
                              dst->type == GGML_TYPE_F32 && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
 
     // fusion is not universally faster on Pascal
@@ -2248,10 +2263,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
     bool use_mul_mat_f     = !ggml_is_quantized(src0->type)
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
-    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear
+    // QTIP_2B uses dequant-to-float + cuBLAS (no native mmvq/mmq kernels yet)
+    const bool is_qtip = src0->type == GGML_TYPE_QTIP_2B;
+    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && !is_qtip
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
         && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
-    bool use_mul_mat_q     = ggml_is_quantized(src0->type) && !bad_padding_clear
+    bool use_mul_mat_q     = ggml_is_quantized(src0->type) && !bad_padding_clear && !is_qtip
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
 
     bool any_gpus_with_slow_fp16 = false;
@@ -2337,7 +2354,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
         if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
-            if (ggml_is_quantized(src0->type)) {
+            if (ggml_is_quantized(src0->type) && src0->type != GGML_TYPE_QTIP_2B) {
                 if (ne2 <= MMVQ_MMID_MAX_BATCH_SIZE) {
                     ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
                     return;
@@ -2422,6 +2439,48 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         ne10*ts_src1_sorted, ne_get_rows*ne10*ts_src1_sorted, ne_get_rows*ne10*ts_src1_sorted, stream);
     CUDA_CHECK(cudaGetLastError());
 
+    // Check if this is a QTIP_2B MoE with sign vectors for full inverse RHT
+    const bool qtip_full_rht = (src0->type == GGML_TYPE_QTIP_2B && dst->src[3] != nullptr);
+
+    // LRU cache for decoded QTIP expert weight matrices (fp16).
+    // Avoids redundant trellis decode when the same expert is reused across tokens.
+    // Cache keyed by raw data pointer (unique per expert per weight tensor).
+    // Capacity: 24 slots × ~4 MB = ~96 MB (covers 8 active experts × 3 projections).
+    struct qtip_cache_entry {
+        const void * key;       // pointer to packed QTIP data for this expert
+        half *       data;      // decoded fp16 matrix on GPU
+        int64_t      size;      // m * n elements
+        uint64_t     last_used; // monotonic counter for LRU eviction
+    };
+    // Configurable via GGML_QTIP_CACHE_SLOTS env var.
+    // Default 384 = 48 weight tensors (3 proj × 16 layers) × 8 active experts.
+    // Memory: 384 × 4 MB = 1.5 GB — fits in 12 GB VRAM with 2.1 GB model + 0.5 GB KV.
+    static thread_local std::vector<qtip_cache_entry> qtip_cache;
+    static thread_local int qtip_cache_capacity = 0;
+    static thread_local uint64_t qtip_cache_tick = 0;
+
+    // Staging buffer for H2D copy when expert weights are in host-pinned memory
+    static thread_local void * qtip_staging_buf = nullptr;
+    static thread_local size_t qtip_staging_size = 0;
+
+    // Cleanup helper for thread_local CUDA allocations
+    struct qtip_cache_cleanup_t {
+        ~qtip_cache_cleanup_t() {
+            for (auto & e : qtip_cache) {
+                if (e.data) { cudaFree(e.data); e.data = nullptr; }
+            }
+            if (qtip_staging_buf) { cudaFree(qtip_staging_buf); qtip_staging_buf = nullptr; }
+        }
+    };
+    static thread_local qtip_cache_cleanup_t qtip_cleanup;
+
+    if (qtip_cache_capacity == 0) {
+        const char * env = getenv("GGML_QTIP_CACHE_SLOTS");
+        qtip_cache_capacity = env ? atoi(env) : 384;
+        if (qtip_cache_capacity < 1) { qtip_cache_capacity = 384; }
+        qtip_cache.resize(qtip_cache_capacity);
+    }
+
     char * src1_data_cur = (char *) src1_sorted.ptr;
     char *  dst_data_cur = (char *)  dst_sorted.ptr;
     for (int64_t i02 = 0; i02 < ne02; ++i02) {
@@ -2429,46 +2488,166 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             continue;
         }
 
-        ggml_tensor src0_slice = *src0;
-        src0_slice.ne[2]    = 1;
-        src0_slice.nb[3]    = src0_slice.nb[2];
-        src0_slice.op       = GGML_OP_VIEW;
-        src0_slice.view_src = dst->src[0]; // non-const pointer to src0
-        src0_slice.data     = (char *) src0->data + i02*nb02;
+        if (qtip_full_rht) {
+            // QTIP activation-transform path: instead of applying expensive 2D FHT
+            // to the full weight matrix (O(mn log mn)), apply cheap 1D Hadamard
+            // transforms to activation vectors (O(n log n + m log m)).
+            //
+            // Math: y = s_l · (1/√m) H_m · W̃ · (1/√n) H_n · s_r · x
+            //
+            // Steps:
+            //   1. Pre-transform input:  x' = (1/√n) H_n · diag(s_r) · x
+            //   2. Raw trellis dequant:  W̃ (no FHT, no sign vectors)
+            //   3. GEMM:                 y' = W̃ · x'
+            //   4. Post-transform output: y = diag(s_l) · (1/√m) H_m · y'
+            const ggml_tensor * sign_r_tensor = dst->src[3];
+            const ggml_tensor * sign_l_tensor = dst->src[4];
 
-        ggml_tensor src1_slice;
-        memset(&src1_slice, 0, sizeof(src1_slice));
-        src1_slice.buffer = src1->buffer;
-        src1_slice.type   = type_src1_sorted;
-        src1_slice.ne[0]  = ne10;
-        src1_slice.ne[1]  = tokens_per_expert[i02];
-        src1_slice.ne[2]  = 1;
-        src1_slice.ne[3]  = 1;
-        src1_slice.nb[0]  = ts_src1_sorted;
-        src1_slice.nb[1]  = src1_slice.ne[0] * src1_slice.nb[0];
-        src1_slice.nb[2]  = src1_slice.ne[1] * src1_slice.nb[1];
-        src1_slice.nb[3]  = src1_slice.ne[2] * src1_slice.nb[2];
-        src1_slice.data   = src1_data_cur;
+            const int64_t m = ne01; // output dim (nrows)
+            const int64_t n = ne00; // input dim (ncols)
+            const int64_t src1_ncols = tokens_per_expert[i02];
 
-        ggml_tensor dst_slice;
-        memset(&dst_slice, 0, sizeof(dst_slice));
-        dst_slice.buffer = dst->buffer;
-        dst_slice.type   = type_dst_sorted;
-        dst_slice.ne[0]  = ne0;
-        dst_slice.ne[1]  = tokens_per_expert[i02];
-        dst_slice.ne[2]  = 1;
-        dst_slice.ne[3]  = 1;
-        dst_slice.nb[0]  = ts_dst_sorted;
-        dst_slice.nb[1]  = dst_slice.ne[0] * dst_slice.nb[0];
-        dst_slice.nb[2]  = dst_slice.ne[1] * dst_slice.nb[1];
-        dst_slice.nb[3]  = dst_slice.ne[2] * dst_slice.nb[2];
-        dst_slice.data   = dst_data_cur;
+            const float * sign_r_e = sign_r_tensor ?
+                (const float *)sign_r_tensor->data + i02 * sign_r_tensor->ne[0] : nullptr;
+            const float * sign_l_e = sign_l_tensor ?
+                (const float *)sign_l_tensor->data + i02 * sign_l_tensor->ne[0] : nullptr;
 
-        ggml_cuda_mul_mat(ctx, &src0_slice, &src1_slice, &dst_slice);
-        CUDA_CHECK(cudaGetLastError());
+            // Step 1: Pre-transform input (in-place on a copy)
+            // src1 is column-major [n, src1_ncols]
+            ggml_cuda_pool_alloc<float> src1_pre(ctx.pool(), n * src1_ncols);
+            CUDA_CHECK(cudaMemcpyAsync(src1_pre.get(), src1_data_cur,
+                                        n * src1_ncols * sizeof(float),
+                                        cudaMemcpyDeviceToDevice, stream));
+            qtip_pre_transform_cuda(src1_pre.get(), sign_r_e, (int)n, (int)src1_ncols, stream);
 
-        src1_data_cur += src1_slice.nb[2];
-        dst_data_cur  +=  dst_slice.nb[2];
+            // Step 2: Raw trellis dequant to fp16 (cached)
+            const void * expert_data = (const char *)src0->data + i02 * nb02;
+            half * W_f16_ptr = nullptr;
+
+            // Look up in cache
+            int cache_hit = -1;
+            int lru_slot = 0;
+            uint64_t oldest = UINT64_MAX;
+            for (int ci = 0; ci < qtip_cache_capacity; ci++) {
+                if (qtip_cache[ci].key == expert_data && qtip_cache[ci].data != nullptr) {
+                    cache_hit = ci;
+                    break;
+                }
+                if (qtip_cache[ci].last_used < oldest) {
+                    oldest = qtip_cache[ci].last_used;
+                    lru_slot = ci;
+                }
+            }
+
+            if (cache_hit >= 0) {
+                // Cache hit — reuse decoded matrix
+                W_f16_ptr = qtip_cache[cache_hit].data;
+                qtip_cache[cache_hit].last_used = ++qtip_cache_tick;
+            } else {
+                // Cache miss — decode and store
+                int slot = lru_slot;
+                if (qtip_cache[slot].data != nullptr && qtip_cache[slot].size < m * n) {
+                    // Old buffer too small, free it
+                    CUDA_CHECK(cudaFree(qtip_cache[slot].data));
+                    qtip_cache[slot].data = nullptr;
+                }
+                if (qtip_cache[slot].data == nullptr) {
+                    CUDA_CHECK(cudaMalloc(&qtip_cache[slot].data, m * n * sizeof(half)));
+                }
+                qtip_cache[slot].key  = expert_data;
+                qtip_cache[slot].size = m * n;
+                qtip_cache[slot].last_used = ++qtip_cache_tick;
+
+                // If expert weights are in host-pinned memory (expert offloading),
+                // async-copy to a GPU staging buffer before dequantizing.
+                const bool src0_on_host = ggml_backend_buft_is_cuda_host(src0->buffer->buft);
+                if (src0_on_host) {
+                    if (qtip_staging_size < (size_t)nb02) {
+                        if (qtip_staging_buf) { CUDA_CHECK(cudaFree(qtip_staging_buf)); }
+                        CUDA_CHECK(cudaMalloc(&qtip_staging_buf, nb02));
+                        qtip_staging_size = nb02;
+                    }
+                    CUDA_CHECK(cudaMemcpyAsync(qtip_staging_buf, expert_data, nb02,
+                                               cudaMemcpyHostToDevice, stream));
+                    dequantize_matrix_qtip_2b_cuda<half>(qtip_staging_buf, qtip_cache[slot].data, m, n, stream);
+                } else {
+                    dequantize_matrix_qtip_2b_cuda<half>(expert_data, qtip_cache[slot].data, m, n, stream);
+                }
+                W_f16_ptr = qtip_cache[slot].data;
+            }
+
+            // Step 3: Convert pre-transformed input to fp16 for HGEMM
+            ggml_cuda_pool_alloc<half> src1_f16(ctx.pool(), n * src1_ncols);
+            {
+                const to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(GGML_TYPE_F32);
+                to_fp16(src1_pre.get(), src1_f16.get(), n * src1_ncols, stream);
+            }
+
+            // cuBLAS GemmEx (fp16 inputs, fp32 accumulation → fp32 output):
+            // y' = W̃ · x'
+            // W̃ is row-major [m, n] = col-major [n, m]. With CUBLAS_OP_T: op(W̃) = [m, n]
+            float * dst_f = (float *)dst_data_cur;
+            {
+                const float alpha = 1.0f;
+                const float beta  = 0.0f;
+                CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(), stream));
+                CUBLAS_CHECK(
+                    cublasGemmEx(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
+                            (int)m, (int)src1_ncols, (int)n,
+                            &alpha, W_f16_ptr,      CUDA_R_16F, (int)n,
+                                    src1_f16.get(), CUDA_R_16F, (int)n,
+                            &beta,  dst_f,          CUDA_R_32F, (int)m,
+                            CUBLAS_COMPUTE_32F,
+                            CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+            }
+
+            // Step 4: Post-transform output (in-place on dst_f)
+            qtip_post_transform_cuda(dst_f, sign_l_e, (int)m, (int)src1_ncols, stream);
+
+            CUDA_CHECK(cudaGetLastError());
+        } else {
+            // Standard path: delegate to ggml_cuda_mul_mat per expert slice
+            ggml_tensor src0_slice = *src0;
+            src0_slice.ne[2]    = 1;
+            src0_slice.nb[3]    = src0_slice.nb[2];
+            src0_slice.op       = GGML_OP_VIEW;
+            src0_slice.view_src = dst->src[0]; // non-const pointer to src0
+            src0_slice.data     = (char *) src0->data + i02*nb02;
+
+            ggml_tensor src1_slice;
+            memset(&src1_slice, 0, sizeof(src1_slice));
+            src1_slice.buffer = src1->buffer;
+            src1_slice.type   = type_src1_sorted;
+            src1_slice.ne[0]  = ne10;
+            src1_slice.ne[1]  = tokens_per_expert[i02];
+            src1_slice.ne[2]  = 1;
+            src1_slice.ne[3]  = 1;
+            src1_slice.nb[0]  = ts_src1_sorted;
+            src1_slice.nb[1]  = src1_slice.ne[0] * src1_slice.nb[0];
+            src1_slice.nb[2]  = src1_slice.ne[1] * src1_slice.nb[1];
+            src1_slice.nb[3]  = src1_slice.ne[2] * src1_slice.nb[2];
+            src1_slice.data   = src1_data_cur;
+
+            ggml_tensor dst_slice;
+            memset(&dst_slice, 0, sizeof(dst_slice));
+            dst_slice.buffer = dst->buffer;
+            dst_slice.type   = type_dst_sorted;
+            dst_slice.ne[0]  = ne0;
+            dst_slice.ne[1]  = tokens_per_expert[i02];
+            dst_slice.ne[2]  = 1;
+            dst_slice.ne[3]  = 1;
+            dst_slice.nb[0]  = ts_dst_sorted;
+            dst_slice.nb[1]  = dst_slice.ne[0] * dst_slice.nb[0];
+            dst_slice.nb[2]  = dst_slice.ne[1] * dst_slice.nb[1];
+            dst_slice.nb[3]  = dst_slice.ne[2] * dst_slice.nb[2];
+            dst_slice.data   = dst_data_cur;
+
+            ggml_cuda_mul_mat(ctx, &src0_slice, &src1_slice, &dst_slice);
+            CUDA_CHECK(cudaGetLastError());
+        }
+
+        src1_data_cur += tokens_per_expert[i02] * ne10 * ts_src1_sorted;
+        dst_data_cur  += tokens_per_expert[i02] * ne0  * ts_dst_sorted;
     }
 
     get_rows_cuda(dst_sorted.ptr, type_dst_sorted, ids_from_sorted, dst->data, dst->type,
@@ -2631,6 +2810,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 default:
                     return false;
             }
+            break;
+        case GGML_OP_HADAMARD:
+            ggml_cuda_op_hadamard(ctx, dst);
             break;
         case GGML_OP_NORM:
             ggml_cuda_op_norm(ctx, dst);
@@ -2941,7 +3123,7 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         }
 
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
-        if (node->op == GGML_OP_MUL_MAT_ID && (!ggml_is_quantized(node->src[0]->type) || node->ne[2] > MMVQ_MMID_MAX_BATCH_SIZE)) {
+        if (node->op == GGML_OP_MUL_MAT_ID && (!ggml_is_quantized(node->src[0]->type) || node->src[0]->type == GGML_TYPE_QTIP_2B || node->ne[2] > MMVQ_MMID_MAX_BATCH_SIZE)) {
             // under these conditions, the mul_mat_id operation will need to synchronize the stream, so we cannot use CUDA graphs
             // TODO: figure out a way to enable for larger batch sizes, without hurting performance
             // ref: https://github.com/ggml-org/llama.cpp/pull/18958
@@ -4737,6 +4919,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     return false;
             }
             break;
+        case GGML_OP_HADAMARD:
+            return op->src[0]->type == GGML_TYPE_F32 && op->ne[0] <= 4096 && ggml_is_contiguous(op->src[0]);
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
             {
@@ -4797,6 +4981,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_IQ4_NL:
                     case GGML_TYPE_IQ4_XS:
                     case GGML_TYPE_BF16:
+                    case GGML_TYPE_QTIP_2B:
                         return true;
                     default:
                         return false;
@@ -5054,7 +5239,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
     const bool integrated = ggml_cuda_info().devices[dev_ctx->device].integrated;
-    return (((ggml_backend_buft_is_cuda(buft) || ggml_backend_buft_is_cuda_split(buft)) && buft->device == dev) || (integrated && ggml_backend_buft_is_cuda_host(buft)));
+    // Accept CUDA host buffers on all GPUs (not just integrated) for QTIP expert offloading
+    return (((ggml_backend_buft_is_cuda(buft) || ggml_backend_buft_is_cuda_split(buft)) && buft->device == dev) || ggml_backend_buft_is_cuda_host(buft));
 }
 
 static int64_t get_op_batch_size(const ggml_tensor * op) {

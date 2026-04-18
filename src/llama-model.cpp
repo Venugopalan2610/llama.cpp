@@ -7521,6 +7521,48 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 layer.ssm_beta_s = create_tensor(tn(LLM_TENSOR_SSM_BETA, "scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
         }
+
+        // generic pass: load optional QTIP sign vectors for any architecture
+        // sign vectors are keyed by tensor name and only loaded when the corresponding weight exists
+        // this avoids having to add sign vector loading to every architecture
+        for (int i = 0; i < n_layer; ++i) {
+            auto & layer = layers[i];
+
+            // attention sign vectors (sign_r = input dim, sign_l = output dim)
+            if (!layer.wq_sign_r && layer.wq) {
+                layer.wq_sign_r = create_tensor(tn(LLM_TENSOR_ATTN_Q_SIGN_R,   "weight", i), {layer.wq->ne[0]}, TENSOR_NOT_REQUIRED);
+                layer.wq_sign_l = create_tensor(tn(LLM_TENSOR_ATTN_Q_SIGN_L,   "weight", i), {layer.wq->ne[1]}, TENSOR_NOT_REQUIRED);
+            }
+            if (!layer.wk_sign_r && layer.wk) {
+                layer.wk_sign_r = create_tensor(tn(LLM_TENSOR_ATTN_K_SIGN_R,   "weight", i), {layer.wk->ne[0]}, TENSOR_NOT_REQUIRED);
+                layer.wk_sign_l = create_tensor(tn(LLM_TENSOR_ATTN_K_SIGN_L,   "weight", i), {layer.wk->ne[1]}, TENSOR_NOT_REQUIRED);
+            }
+            if (!layer.wv_sign_r && layer.wv) {
+                layer.wv_sign_r = create_tensor(tn(LLM_TENSOR_ATTN_V_SIGN_R,   "weight", i), {layer.wv->ne[0]}, TENSOR_NOT_REQUIRED);
+                layer.wv_sign_l = create_tensor(tn(LLM_TENSOR_ATTN_V_SIGN_L,   "weight", i), {layer.wv->ne[1]}, TENSOR_NOT_REQUIRED);
+            }
+            if (!layer.wo_sign_r && layer.wo) {
+                layer.wo_sign_r = create_tensor(tn(LLM_TENSOR_ATTN_OUT_SIGN_R, "weight", i), {layer.wo->ne[0]}, TENSOR_NOT_REQUIRED);
+                layer.wo_sign_l = create_tensor(tn(LLM_TENSOR_ATTN_OUT_SIGN_L, "weight", i), {layer.wo->ne[1]}, TENSOR_NOT_REQUIRED);
+            }
+
+            // MoE expert sign vectors (sign_r = input dim per expert, sign_l = output dim per expert)
+            if (!layer.ffn_gate_exps_sign_r && layer.ffn_gate_exps) {
+                const int64_t n_exp = layer.ffn_gate_exps->ne[2];
+                layer.ffn_gate_exps_sign_r = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS_SIGN_R, "weight", i), {layer.ffn_gate_exps->ne[0], n_exp}, TENSOR_NOT_REQUIRED);
+                layer.ffn_gate_exps_sign_l = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS_SIGN_L, "weight", i), {layer.ffn_gate_exps->ne[1], n_exp}, TENSOR_NOT_REQUIRED);
+            }
+            if (!layer.ffn_down_exps_sign_r && layer.ffn_down_exps) {
+                const int64_t n_exp = layer.ffn_down_exps->ne[2];
+                layer.ffn_down_exps_sign_r = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS_SIGN_R, "weight", i), {layer.ffn_down_exps->ne[0], n_exp}, TENSOR_NOT_REQUIRED);
+                layer.ffn_down_exps_sign_l = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS_SIGN_L, "weight", i), {layer.ffn_down_exps->ne[1], n_exp}, TENSOR_NOT_REQUIRED);
+            }
+            if (!layer.ffn_up_exps_sign_r && layer.ffn_up_exps) {
+                const int64_t n_exp = layer.ffn_up_exps->ne[2];
+                layer.ffn_up_exps_sign_r = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS_SIGN_R, "weight", i), {layer.ffn_up_exps->ne[0], n_exp}, TENSOR_NOT_REQUIRED);
+                layer.ffn_up_exps_sign_l = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS_SIGN_L, "weight", i), {layer.ffn_up_exps->ne[1], n_exp}, TENSOR_NOT_REQUIRED);
+            }
+        }
     }
 
     ml.done_getting_tensors();
@@ -7664,6 +7706,27 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
         }
+    }
+
+    // build QTIP sign vector lookup map: weight tensor → (sign_r, sign_l)
+    for (const auto & layer : layers) {
+        auto add_sign = [&](const ggml_tensor * w, ggml_tensor * sr, ggml_tensor * sl) {
+            if (w && sr) {
+                qtip_sign_map[w] = { sr, sl };
+            }
+        };
+        // attention
+        add_sign(layer.wq, layer.wq_sign_r, layer.wq_sign_l);
+        add_sign(layer.wk, layer.wk_sign_r, layer.wk_sign_l);
+        add_sign(layer.wv, layer.wv_sign_r, layer.wv_sign_l);
+        add_sign(layer.wo, layer.wo_sign_r, layer.wo_sign_l);
+        // MoE experts
+        add_sign(layer.ffn_gate_exps, layer.ffn_gate_exps_sign_r, layer.ffn_gate_exps_sign_l);
+        add_sign(layer.ffn_down_exps, layer.ffn_down_exps_sign_r, layer.ffn_down_exps_sign_l);
+        add_sign(layer.ffn_up_exps,   layer.ffn_up_exps_sign_r,   layer.ffn_up_exps_sign_l);
+    }
+    if (!qtip_sign_map.empty()) {
+        LLAMA_LOG_INFO("%s: loaded QTIP sign vectors for %zu weight tensors\n", __func__, qtip_sign_map.size());
     }
 
     return true;
@@ -8698,6 +8761,7 @@ llama_model_params llama_model_default_params() {
         /*.tensor_buft_overrides       =*/ nullptr,
         /*.n_gpu_layers                =*/ -1,
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
+        /*.qtip_expert_offload         =*/ false,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,

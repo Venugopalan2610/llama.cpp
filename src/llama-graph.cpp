@@ -878,6 +878,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     mctx             (params.mctx),
     cross            (params.cross),
+    qtip_signs       (params.qtip_signs),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -902,6 +903,23 @@ ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
           ggml_tensor * w_s) const {
+    // QTIP sign vector auto-detection
+    ggml_tensor * sign_r = nullptr;
+    ggml_tensor * sign_l = nullptr;
+    if (qtip_signs) {
+        auto it = qtip_signs->find(w);
+        if (it != qtip_signs->end()) {
+            sign_r = it->second.first;
+            sign_l = it->second.second;
+        }
+    }
+
+    // QTIP pre-transform: x' = H_n · diag(s_r) · x
+    if (sign_r) {
+        cur = ggml_mul(ctx0, cur, sign_r);
+        cur = ggml_hadamard(ctx0, cur);
+    }
+
     ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
 
     for (const auto & lora : *loras) {
@@ -926,6 +944,14 @@ ggml_tensor * llm_graph_context::build_lora_mm(
         res = ggml_mul(ctx0, res, w_s);
     }
 
+    // QTIP post-transform: y' = diag(s_l) · H_m · y
+    if (sign_r) {
+        res = ggml_hadamard(ctx0, res);
+        if (sign_l) {
+            res = ggml_mul(ctx0, res, sign_l);
+        }
+    }
+
     return res;
 }
 
@@ -934,6 +960,16 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * cur, // ggml_tensor * b
           ggml_tensor * ids) const {
     ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
+
+    // QTIP sign vectors for per-expert transforms: passed via src[3]/src[4]
+    if (qtip_signs) {
+        auto it = qtip_signs->find(w);
+        if (it != qtip_signs->end()) {
+            res->src[3] = it->second.first;  // sign_r
+            res->src[4] = it->second.second;  // sign_l
+        }
+    }
+
     for (const auto & lora : *loras) {
         llama_adapter_lora_weight * lw = lora.first->get_weight(w);
         if (lw == nullptr) {

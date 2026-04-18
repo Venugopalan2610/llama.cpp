@@ -291,6 +291,9 @@ extern "C" {
         int32_t n_gpu_layers; // number of layers to store in VRAM, a negative value means all layers
         enum llama_split_mode split_mode; // how to split the model across multiple GPUs
 
+        // keep MoE expert weights in CPU pinned memory, use GPU dequant cache for QTIP models
+        bool qtip_expert_offload;
+
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;
 

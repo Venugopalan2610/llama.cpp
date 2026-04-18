@@ -1316,9 +1316,10 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
         mparams.devices = params.devices.data();
     }
 
-    mparams.n_gpu_layers    = params.n_gpu_layers;
-    mparams.main_gpu        = params.main_gpu;
-    mparams.split_mode      = params.split_mode;
+    mparams.n_gpu_layers         = params.n_gpu_layers;
+    mparams.main_gpu             = params.main_gpu;
+    mparams.split_mode           = params.split_mode;
+    mparams.qtip_expert_offload  = params.qtip_expert_offload;
     mparams.tensor_split    = params.tensor_split;
     mparams.use_mmap        = params.use_mmap;
     mparams.use_direct_io   = params.use_direct_io;

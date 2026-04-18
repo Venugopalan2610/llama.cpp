@@ -143,3 +143,15 @@ poetry.toml
 /.windsurf/
 # emscripten
 a.out.*
+**venv/**
+*.gguf
+*.csv
+*.dat
+*.zip
+perplexity_output*.txt
+tensor_types*.txt
+test_W_zeros
+test_fht
+test_fht_2048
+test_qtip_dequant
+test_sizeof

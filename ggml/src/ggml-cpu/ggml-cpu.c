@@ -7,6 +7,7 @@
 #include "ggml-cpu-impl.h"
 #include "ggml-impl.h"
 #include "quants.h"
+#include "ggml-quants.h"
 #include "ggml-threading.h"
 #include "unary-ops.h"
 #include "binary-ops.h"
@@ -203,6 +204,7 @@ typedef pthread_t ggml_thread_t;
 #include <mach/mach.h>
 #include <TargetConditionals.h>
 #endif
+extern void ggml_vec_dot_qtip_2b_f32(int n, float * s, size_t bs, const void * vx, size_t bx, const void * vy, size_t by, int nrc);
 
 static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_F32] = {
@@ -274,6 +276,12 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .from_float               = quantize_row_nvfp4,
         .vec_dot                  = ggml_vec_dot_nvfp4_q8_0,
         .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_QTIP_2B] = {
+        .from_float               = NULL,
+        .vec_dot                  = ggml_vec_dot_qtip_2b_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
         .nrows                    = 1,
     },
     [GGML_TYPE_Q2_K] = {
@@ -1140,6 +1148,234 @@ void ggml_set_f32_nd(const struct ggml_tensor * tensor, int i0, int i1, int i2, 
 
 ////////////////////////////////////////////////////////////////////////////////
 
+// QTIP tile-aware CPU mul_mat.
+// QTIP blocks are 16×16 tiles stored in (row_tile, col_tile) order.
+// ggml's per-row vec_dot can't handle this, so we decode tiles directly here.
+static bool ggml_compute_forward_mul_mat_qtip(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+
+    if (src0->type != GGML_TYPE_QTIP_2B) {
+        return false;
+    }
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t nrows = ne01;  // output dim (m)
+    const int64_t ncols = ne00;  // input dim (n)
+    const int64_t n_col_tiles = ncols / 16;
+    const int64_t n_row_tiles = nrows / 16;
+
+    GGML_ASSERT(ncols % 16 == 0);
+    GGML_ASSERT(nrows % 16 == 0);
+
+    // broadcast factors
+    const int64_t r2 = ne12 / ne02;
+    const int64_t r3 = ne13 / ne03;
+
+    // For each batch/broadcast dimension
+    for (int64_t i13 = 0; i13 < ne13; i13++) {
+        for (int64_t i12 = 0; i12 < ne12; i12++) {
+            const int64_t i03 = i13 / r3;
+            const int64_t i02 = i12 / r2;
+
+            const block_qtip_2b * src0_base = (const block_qtip_2b *)
+                ((const char *)src0->data + i02 * nb02 + i03 * nb03);
+
+            for (int64_t i11 = 0; i11 < ne11; i11++) {
+                const float * src1_col = (const float *)
+                    ((const char *)src1->data + i11 * nb11 + i12 * nb12 + i13 * nb13);
+                float * dst_col = (float *)
+                    ((char *)dst->data + i11 * nb1 + i12 * nb2 + i13 * nb3);
+
+                // Split row tiles across threads
+                for (int64_t rt = ith; rt < n_row_tiles; rt += nth) {
+                    float sums[16] = {0};
+
+                    for (int64_t ct = 0; ct < n_col_tiles; ct++) {
+                        float tile_vals[QTIP_BLOCK_SIZE];
+                        dequantize_block_qtip_2b(&src0_base[rt * n_col_tiles + ct], tile_vals);
+
+                        // Accumulate: each local row (0..15) dots with its 16 column values
+                        for (int lr = 0; lr < 16; lr++) {
+                            for (int lc = 0; lc < 16; lc++) {
+                                sums[lr] += tile_vals[lr * 16 + lc] * src1_col[ct * 16 + lc];
+                            }
+                        }
+                    }
+
+                    for (int lr = 0; lr < 16; lr++) {
+                        dst_col[rt * 16 + lr] = sums[lr];
+                    }
+                }
+            }
+        }
+    }
+
+    return true;
+}
+
+// QTIP tile-aware CPU mul_mat_id (MoE path).
+// Like the above but also applies per-expert activation transforms
+// (sign_r, Hadamard, matmul, Hadamard, sign_l) since the graph builder
+// passes sign vectors via src[3] and src[4].
+static bool ggml_compute_forward_mul_mat_id_qtip(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+    const struct ggml_tensor * ids  = dst->src[2];
+
+    if (src0->type != GGML_TYPE_QTIP_2B) {
+        return false;
+    }
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t nrows = ne01;  // output dim (m)
+    const int64_t ncols = ne00;  // input dim (n)
+    const int64_t n_col_tiles = ncols / 16;
+    const int64_t n_row_tiles = nrows / 16;
+
+    GGML_ASSERT(ncols % 16 == 0);
+    GGML_ASSERT(nrows % 16 == 0);
+
+    const int n_ids = ids->ne[0]; // n_expert_used
+    const int n_as  = ne02;       // n_expert
+
+    // Sign vectors (optional, from graph builder)
+    const struct ggml_tensor * sign_r_tensor = dst->src[3]; // [ncols, n_expert] or NULL
+    const struct ggml_tensor * sign_l_tensor = dst->src[4]; // [nrows, n_expert] or NULL
+
+    // Thread 0 builds the expert→token mapping; other threads wait at barrier
+    // Use workspace for row mappings
+    struct qtip_mmid_map {
+        int32_t token_id;  // index into src1 (column)
+        int32_t expert_slot; // which of n_ids this expert was (for output routing)
+    };
+
+    // We need to coordinate: thread 0 builds mapping, others wait.
+    // Use wdata for the mapping array.
+    void * wdata_cur = params->wdata;
+
+    int64_t * expert_counts = (int64_t *)wdata_cur;
+    wdata_cur = (char *)wdata_cur + GGML_PAD(n_as * sizeof(int64_t), 16);
+
+    struct qtip_mmid_map * expert_maps = (struct qtip_mmid_map *)wdata_cur;
+    // max entries per expert = ids->ne[1] (n_tokens), but all experts share one big array
+    // Use n_as * ids->ne[1] entries (over-allocate slightly)
+    wdata_cur = (char *)wdata_cur + GGML_PAD(n_as * ids->ne[1] * sizeof(struct qtip_mmid_map), 16);
+
+    if (ith == 0) {
+        memset(expert_counts, 0, n_as * sizeof(int64_t));
+
+        for (int64_t token = 0; token < ids->ne[1]; token++) {
+            for (int eid = 0; eid < n_ids; eid++) {
+                const int32_t expert = *(const int32_t *)((const char *)ids->data + token * ids->nb[1] + eid * ids->nb[0]);
+                GGML_ASSERT(expert >= 0 && expert < n_as);
+
+                int64_t idx = expert * ids->ne[1] + expert_counts[expert];
+                expert_maps[idx].token_id = (int32_t)token;
+                expert_maps[idx].expert_slot = eid;
+                expert_counts[expert]++;
+            }
+        }
+    }
+
+    ggml_barrier(params->threadpool);
+
+    // Process each active expert
+    for (int cur_e = 0; cur_e < n_as; cur_e++) {
+        const int64_t n_tokens_for_expert = expert_counts[cur_e];
+        if (n_tokens_for_expert == 0) continue;
+
+        const block_qtip_2b * src0_base = (const block_qtip_2b *)
+            ((const char *)src0->data + cur_e * nb02);
+
+        // Per-expert sign vectors
+        const float * sign_r = NULL;
+        const float * sign_l = NULL;
+        if (sign_r_tensor) {
+            sign_r = (const float *)((const char *)sign_r_tensor->data + cur_e * sign_r_tensor->nb[1]);
+        }
+        if (sign_l_tensor) {
+            sign_l = (const float *)((const char *)sign_l_tensor->data + cur_e * sign_l_tensor->nb[1]);
+        }
+
+        // Process each token assigned to this expert
+        for (int64_t ti = 0; ti < n_tokens_for_expert; ti++) {
+            const struct qtip_mmid_map * mapping = &expert_maps[cur_e * ids->ne[1] + ti];
+            const int32_t token = mapping->token_id;
+            const int32_t eslot = mapping->expert_slot;
+
+            // Get input column: src1[*, eslot%ne11, token]
+            // For gate/up: ne11=1 (broadcast same input to all expert slots)
+            // For down: ne11=n_ids (each slot has its own swiglu output)
+            const int64_t src1_e = eslot % ne11;
+            const float * src1_col = (const float *)((const char *)src1->data + src1_e * nb11 + token * nb12);
+
+            // Pre-transform: x' = (1/sqrt(n)) * H_n(s_r * x)
+            float * x_pre = (float *)((char *)wdata_cur + ith * ncols * sizeof(float));
+            if (sign_r) {
+                for (int64_t j = 0; j < ncols; j++) {
+                    x_pre[j] = src1_col[j] * sign_r[j];
+                }
+            } else {
+                memcpy(x_pre, src1_col, ncols * sizeof(float));
+            }
+            ggml_fht_f32(x_pre, (int)ncols);
+
+            // Tile-aware matmul: y' = W_tilde @ x' (split row tiles across threads)
+            // Output: dst[eslot, token] shape [nrows, n_ids, n_tokens]
+            float * dst_col = (float *)((char *)dst->data + eslot * nb1 + token * nb2);
+
+            for (int64_t rt = ith; rt < n_row_tiles; rt += nth) {
+                float sums[16] = {0};
+
+                for (int64_t ct = 0; ct < n_col_tiles; ct++) {
+                    float tile_vals[QTIP_BLOCK_SIZE];
+                    dequantize_block_qtip_2b(&src0_base[rt * n_col_tiles + ct], tile_vals);
+
+                    for (int lr = 0; lr < 16; lr++) {
+                        for (int lc = 0; lc < 16; lc++) {
+                            sums[lr] += tile_vals[lr * 16 + lc] * x_pre[ct * 16 + lc];
+                        }
+                    }
+                }
+
+                for (int lr = 0; lr < 16; lr++) {
+                    dst_col[rt * 16 + lr] = sums[lr];
+                }
+            }
+
+            ggml_barrier(params->threadpool);
+
+            // Post-transform (single-threaded per token to avoid races): y = s_l * (1/sqrt(m)) * H_m(y')
+            if (ith == 0) {
+                ggml_fht_f32(dst_col, (int)nrows);
+                if (sign_l) {
+                    for (int64_t j = 0; j < nrows; j++) {
+                        dst_col[j] *= sign_l[j];
+                    }
+                }
+            }
+
+            ggml_barrier(params->threadpool);
+        }
+    }
+    return true;
+}
+
 // ggml_compute_forward_mul_mat
 
 static void ggml_compute_forward_mul_mat_one_chunk(
@@ -1235,6 +1471,11 @@ static void ggml_compute_forward_mul_mat_one_chunk(
 void ggml_compute_forward_mul_mat(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
+
+    // QTIP_2B uses 2D 16×16 tile layout — bypass generic per-row vec_dot
+    if (ggml_compute_forward_mul_mat_qtip(params, dst)) {
+        return;
+    }
 
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
@@ -1509,6 +1750,11 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
 static void ggml_compute_forward_mul_mat_id(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
+
+    // QTIP_2B uses 2D 16×16 tile layout + per-expert activation transforms
+    if (ggml_compute_forward_mul_mat_id_qtip(params, dst)) {
+        return;
+    }
 
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
@@ -2003,6 +2249,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_glu(params, tensor);
             } break;
+        case GGML_OP_HADAMARD:
+            {
+                ggml_compute_forward_hadamard(params, tensor);
+            } break;
         case GGML_OP_GET_REL_POS:
             {
                 ggml_compute_forward_get_rel_pos(params, tensor);
@@ -2270,6 +2520,12 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                     GGML_ABORT("fatal error");
             }
             break;
+        case GGML_OP_HADAMARD:
+            {
+                // Hadamard is inherently sequential along the transform dimension,
+                // but can parallelize across rows (ne[1] * ne[2] * ne[3])
+                n_tasks = n_threads;
+            } break;
         case GGML_OP_SILU_BACK:
         case GGML_OP_MUL:
         case GGML_OP_DIV:
@@ -2805,18 +3061,29 @@ struct ggml_cplan ggml_graph_plan(
                         const struct ggml_tensor * src0 = node->src[0];
                         const struct ggml_tensor * src1 = node->src[1];
                         const struct ggml_tensor * ids = node->src[2];
-                        const enum ggml_type vec_dot_type = type_traits_cpu[src0->type].vec_dot_type;
-                        const int n_as = src0->ne[2];
-                        // src1
-                        if (src1->type != vec_dot_type) {
-                            cur += ggml_row_size(vec_dot_type, ggml_nelements(src1)) + sizeof(int64_t);
+
+                        if (src0->type == GGML_TYPE_QTIP_2B) {
+                            const int n_as = src0->ne[2];
+                            // expert_counts
+                            cur += GGML_PAD(n_as * sizeof(int64_t), 16);
+                            // expert_maps (qtip_mmid_map: 2 x int32_t per entry)
+                            cur += GGML_PAD(n_as * ids->ne[1] * 2 * sizeof(int32_t), 16);
+                            // per-thread pre-transform buffers
+                            cur += (size_t)n_tasks * src0->ne[0] * sizeof(float);
+                        } else {
+                            const enum ggml_type vec_dot_type = type_traits_cpu[src0->type].vec_dot_type;
+                            const int n_as = src0->ne[2];
+                            // src1
+                            if (src1->type != vec_dot_type) {
+                                cur += ggml_row_size(vec_dot_type, ggml_nelements(src1)) + sizeof(int64_t);
+                            }
+                            // matrix_row_counts
+                            cur += n_as * sizeof(int64_t) + sizeof(int64_t);
+                            // matrix_rows
+                            cur += n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping) + sizeof(int64_t);
+                            // atomic_current_chunk
+                            cur += CACHE_LINE_SIZE*n_as + CACHE_LINE_SIZE;
                         }
-                        // matrix_row_counts
-                        cur += n_as * sizeof(int64_t) + sizeof(int64_t);
-                        // matrix_rows
-                        cur += n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping) + sizeof(int64_t);
-                        // atomic_current_chunk
-                        cur += CACHE_LINE_SIZE*n_as + CACHE_LINE_SIZE;
                     } break;
                 case GGML_OP_OUT_PROD:
                     {

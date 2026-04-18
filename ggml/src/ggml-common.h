@@ -266,6 +266,14 @@ typedef struct {
 } block_tq2_0;
 static_assert(sizeof(block_tq2_0) == sizeof(ggml_half) + QK_K / 4, "wrong tq2_0 block size/padding");
 
+// QTIP trellis-coded quantization, ~2.125 bpw
+#define QTIP_BLOCK_SIZE 256
+typedef struct {
+    ggml_half d;               // scale factor (2 bytes)
+    uint8_t  trellis_data[66]; // trellis codes (66 bytes, 524 bits used)
+} block_qtip_2b;
+static_assert(sizeof(block_qtip_2b) == sizeof(ggml_half) + 66, "wrong qtip_2b block size/padding");
+
 //
 // Super-block quantization structures
 //

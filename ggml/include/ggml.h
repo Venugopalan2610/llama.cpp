@@ -428,7 +428,8 @@ extern "C" {
         // GGML_TYPE_IQ4_NL_8_8 = 38,
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
-        GGML_TYPE_COUNT   = 41,
+        GGML_TYPE_QTIP_2B = 41,
+        GGML_TYPE_COUNT   = 42,
     };
 
     // precision
@@ -574,6 +575,8 @@ extern "C" {
         GGML_OP_OPT_STEP_SGD,
 
         GGML_OP_GLU,
+
+        GGML_OP_HADAMARD,
 
         GGML_OP_COUNT,
     };
@@ -1345,6 +1348,12 @@ extern "C" {
             struct ggml_tensor  * b,
             float                 alpha,
             float                 limit);
+
+    // Walsh-Hadamard transform on the last dimension (must be power of 2)
+    // Applies unscaled WHT then divides by sqrt(n) where n = ne[0]
+    GGML_API struct ggml_tensor * ggml_hadamard(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a);
 
     // normalize along rows
     GGML_API struct ggml_tensor * ggml_norm(

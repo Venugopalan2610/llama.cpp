@@ -837,8 +837,47 @@ static int llama_model_load(struct gguf_context * metadata, llama_model_set_tens
     model.t_start_us = tm.t_start_us;
 
     try {
+        // When qtip_expert_offload is enabled, inject tensor buffer type overrides
+        // to place MoE expert weight tensors in host-pinned memory (for GPU dequant cache).
+        std::vector<llama_model_tensor_buft_override> combined_overrides;
+        const llama_model_tensor_buft_override * effective_overrides = params.tensor_buft_overrides;
+
+        if (params.qtip_expert_offload) {
+            // Find the first GPU device to get its host buffer type (pinned memory)
+            ggml_backend_buffer_type_t host_buft = nullptr;
+            for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+                auto * dev = ggml_backend_dev_get(i);
+                if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    host_buft = ggml_backend_dev_host_buffer_type(dev);
+                    break;
+                }
+            }
+            if (host_buft) {
+                LLAMA_LOG_INFO("%s: QTIP expert offload enabled — expert weights will use %s\n",
+                    __func__, ggml_backend_buft_name(host_buft));
+                // Copy existing user overrides first
+                if (params.tensor_buft_overrides) {
+                    for (const auto * o = params.tensor_buft_overrides; o->pattern != nullptr; ++o) {
+                        combined_overrides.push_back(*o);
+                    }
+                }
+                // Add expert weight overrides (gate, up, down expert tensors)
+                static const char * qtip_expert_patterns[] = {
+                    "ffn_gate_exps", "ffn_up_exps", "ffn_down_exps", nullptr
+                };
+                for (const char ** p = qtip_expert_patterns; *p; ++p) {
+                    combined_overrides.push_back({*p, host_buft});
+                }
+                // NULL-terminated sentinel
+                combined_overrides.push_back({nullptr, nullptr});
+                effective_overrides = combined_overrides.data();
+            } else {
+                LLAMA_LOG_WARN("%s: QTIP expert offload requested but no GPU device found, ignoring\n", __func__);
+            }
+        }
+
         llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, params.use_mmap, params.use_direct_io,
-            params.check_tensors, params.no_alloc, params.kv_overrides, params.tensor_buft_overrides);
+            params.check_tensors, params.no_alloc, params.kv_overrides, effective_overrides);
 
         ml.print_info();
 

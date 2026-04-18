@@ -726,6 +726,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_nvfp4,
         .from_float_ref           = (ggml_from_float_t)quantize_row_nvfp4_ref,
     },
+    [GGML_TYPE_QTIP_2B] = {
+        .type_name                = "qtip_2b",
+        .blck_size                = QTIP_BLOCK_SIZE,
+        .type_size                = sizeof(block_qtip_2b),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_qtip_2b,
+        .from_float_ref           = NULL,
+    },
     [GGML_TYPE_Q2_K] = {
         .type_name                = "q2_K",
         .blck_size                = QK_K,
@@ -1055,9 +1063,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "HADAMARD",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1165,9 +1175,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "hadamard(x)",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3053,6 +3065,21 @@ struct ggml_tensor * ggml_swiglu_oai(
     struct ggml_tensor * result = ggml_glu_impl(ctx, a, b, GGML_GLU_OP_SWIGLU_OAI, false);
     ggml_set_op_params_f32(result, 2, alpha);
     ggml_set_op_params_f32(result, 3, limit);
+
+    return result;
+}
+
+// ggml_hadamard
+
+struct ggml_tensor * ggml_hadamard(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a) {
+    GGML_ASSERT(a->ne[0] > 0 && (a->ne[0] & (a->ne[0] - 1)) == 0); // must be power of 2
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
+
+    result->op     = GGML_OP_HADAMARD;
+    result->src[0] = a;
 
     return result;
 }

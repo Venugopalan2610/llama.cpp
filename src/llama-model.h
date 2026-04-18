@@ -300,6 +300,22 @@ struct llama_layer {
     struct ggml_tensor * ffn_down_exps_s   = nullptr;
     struct ggml_tensor * ffn_up_exps_s     = nullptr;
 
+    // QTIP sign vectors for inverse RHT (attention + MoE)
+    struct ggml_tensor * wq_sign_r         = nullptr;
+    struct ggml_tensor * wk_sign_r         = nullptr;
+    struct ggml_tensor * wv_sign_r         = nullptr;
+    struct ggml_tensor * wo_sign_r         = nullptr;
+    struct ggml_tensor * wq_sign_l         = nullptr;
+    struct ggml_tensor * wk_sign_l         = nullptr;
+    struct ggml_tensor * wv_sign_l         = nullptr;
+    struct ggml_tensor * wo_sign_l         = nullptr;
+    struct ggml_tensor * ffn_gate_exps_sign_r = nullptr;
+    struct ggml_tensor * ffn_down_exps_sign_r = nullptr;
+    struct ggml_tensor * ffn_up_exps_sign_r   = nullptr;
+    struct ggml_tensor * ffn_gate_exps_sign_l = nullptr;
+    struct ggml_tensor * ffn_down_exps_sign_l = nullptr;
+    struct ggml_tensor * ffn_up_exps_sign_l   = nullptr;
+
     // ff MoE latent proj
     struct ggml_tensor * ffn_latent_down = nullptr;
     struct ggml_tensor * ffn_latent_up   = nullptr;
@@ -529,6 +545,10 @@ struct llama_model {
 
     // for quantize-stats only
     std::vector<std::pair<std::string, struct ggml_tensor *>> tensors_by_name;
+
+    // QTIP sign vector lookup: maps weight tensor → (sign_r, sign_l)
+    // Populated during load_tensors() for any architecture with QTIP_2B weights
+    std::unordered_map<const ggml_tensor *, std::pair<ggml_tensor *, ggml_tensor *>> qtip_sign_map;
 
     // for keeping track of associated LoRA adapters
     std::unordered_set<llama_adapter_lora *> loras;

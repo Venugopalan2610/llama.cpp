@@ -29,7 +29,7 @@ llm_build_olmoe::llm_build_olmoe(const llama_model & model, const llm_graph_para
 
         // self_attention
         {
-            // compute Q and K and RoPE them
+            // compute Q, K, V — QTIP transforms auto-applied by build_lora_mm
             ggml_tensor * Qcur = build_lora_mm(model.layers[il].wq, cur);
             cb(Qcur, "Qcur", il);
 
@@ -67,6 +67,7 @@ llm_build_olmoe::llm_build_olmoe(const llama_model & model, const llm_graph_para
             cb(Kcur, "Kcur", il);
             cb(Vcur, "Vcur", il);
 
+            // wo transform also auto-applied inside build_attn → build_lora_mm
             cur = build_attn(inp_attn,
                     model.layers[il].wo, NULL,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
@@ -78,7 +79,7 @@ llm_build_olmoe::llm_build_olmoe(const llama_model & model, const llm_graph_para
         ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
         cb(ffn_inp, "ffn_inp", il);
 
-        // MoE branch
+        // MoE branch — QTIP sign vectors auto-applied by build_lora_mm_id
         cur = build_norm(ffn_inp,
                 model.layers[il].ffn_norm, NULL,
                 LLM_NORM_RMS, il);
